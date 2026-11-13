@@ -11,10 +11,13 @@ import json
 import sqlite3
 import datetime
 import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 BASE_ROOT = r"G:\martha garcia\VEHICULOS RETENIDOS VALIDAR RUNT____"
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(CURRENT_DIR, "progreso_consultas.db")
+REPORTS_DIR = os.path.join(CURRENT_DIR, "REPORTES_BD")
 
 EXCLUDED_FOLDERS = {
     "PROGRAMA_GENERADOR_RUNT",
@@ -36,6 +39,10 @@ def init_db():
             propietario TEXT,
             tipo_doc TEXT,
             nro_doc TEXT,
+            clase TEXT DEFAULT '',
+            marca TEXT DEFAULT '',
+            linea TEXT DEFAULT '',
+            modelo TEXT DEFAULT '',
             estado_consulta TEXT,
             tiene_embargo_limitacion TEXT,
             detalle_limitacion TEXT,
@@ -47,6 +54,15 @@ def init_db():
             UNIQUE(patio, anio, placa)
         )
     """)
+    # Migración segura de columnas adicionales si la tabla ya existía antes
+    cur.execute("PRAGMA table_info(historial_consultas)")
+    existing_cols = {row[1] for row in cur.fetchall()}
+    for col_name in ["clase", "marca", "linea", "modelo"]:
+        if col_name not in existing_cols:
+            try:
+                cur.execute(f"ALTER TABLE historial_consultas ADD COLUMN {col_name} TEXT DEFAULT ''")
+            except Exception:
+                pass
     conn.commit()
     conn.close()
 
@@ -277,6 +293,55 @@ def scan_patio_anio(patio, anio):
             "rtm_estado": rtm_est
         })
 
+    # Sincronizar masivamente en SQLite para que la base de datos tenga siempre todo el inventario al día
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        batch_rows = [
+            (
+                v["patio"], v["anio"], v["placa"], v["propietario"],
+                v["tipo_doc_runt"], v["nro_doc"],
+                v["clase"], v["marca"], v["linea"], v["modelo"],
+                v["estado"], v["tiene_embargo"], v["detalle_limitacion"],
+                v["soat_estado"], v["rtm_estado"], v["num_imgs"], v["exp_dir"], now_str
+            )
+            for v in vehicles
+        ]
+        cur.executemany("""
+            INSERT INTO historial_consultas (
+                patio, anio, placa, propietario, tipo_doc, nro_doc,
+                clase, marca, linea, modelo,
+                estado_consulta, tiene_embargo_limitacion, detalle_limitacion,
+                soat_estado, rtm_estado, capturas_guardadas, ruta_expediente, fecha_actualizacion
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(patio, anio, placa) DO UPDATE SET
+                propietario=excluded.propietario,
+                tipo_doc=excluded.tipo_doc,
+                nro_doc=excluded.nro_doc,
+                clase=CASE WHEN excluded.clase != '' THEN excluded.clase ELSE historial_consultas.clase END,
+                marca=CASE WHEN excluded.marca != '' THEN excluded.marca ELSE historial_consultas.marca END,
+                linea=CASE WHEN excluded.linea != '' THEN excluded.linea ELSE historial_consultas.linea END,
+                modelo=CASE WHEN excluded.modelo != '' THEN excluded.modelo ELSE historial_consultas.modelo END,
+                estado_consulta=excluded.estado_consulta,
+                tiene_embargo_limitacion=CASE
+                    WHEN historial_consultas.tiene_embargo_limitacion IS NOT NULL AND historial_consultas.tiene_embargo_limitacion != '' AND historial_consultas.tiene_embargo_limitacion != 'NO'
+                    THEN historial_consultas.tiene_embargo_limitacion
+                    ELSE excluded.tiene_embargo_limitacion
+                END,
+                detalle_limitacion=CASE
+                    WHEN historial_consultas.detalle_limitacion IS NOT NULL AND historial_consultas.detalle_limitacion != '' AND historial_consultas.detalle_limitacion != 'NINGUNO'
+                    THEN historial_consultas.detalle_limitacion
+                    ELSE excluded.detalle_limitacion
+                END,
+                capturas_guardadas=excluded.capturas_guardadas,
+                ruta_expediente=excluded.ruta_expediente
+        """, batch_rows)
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
     return {"vehicles": vehicles, "stats": stats}
 
 def save_consulta_result(patio, anio, placa, propietario, tipo_doc, nro_doc,
@@ -311,3 +376,353 @@ def save_consulta_result(patio, anio, placa, propietario, tipo_doc, nro_doc,
     ))
     conn.commit()
     conn.close()
+
+
+def sync_scope_to_sqlite(scope="PATIO", patio=None, anio=None, log_cb=None):
+    """
+    Sincroniza los expedientes físicos hacia SQLite según el alcance elegido:
+    - 'ANIO': Solo el Patio y Año actuales
+    - 'PATIO': Todos los años del Patio seleccionado
+    - 'TODOS': Todos los Patios y todos los Años
+    """
+    init_db()
+    if scope == "ANIO" and patio and anio:
+        if log_cb:
+            log_cb(f"Sincronizando BD SQLite: {patio} -> {anio}...")
+        scan_patio_anio(patio, anio)
+    elif scope == "PATIO" and patio:
+        for a in list_anios(patio):
+            if log_cb:
+                log_cb(f"Sincronizando BD SQLite: {patio} -> {a}...")
+            scan_patio_anio(patio, a)
+    elif scope == "TODOS":
+        for p in list_patios():
+            for a in list_anios(p):
+                if log_cb:
+                    log_cb(f"Sincronizando BD SQLite: {p} -> {a}...")
+                scan_patio_anio(p, a)
+
+
+def generate_sqlite_excel_report(output_path=None, scope="PATIO", patio=None, anio=None, log_cb=None):
+    """
+    Extrae toda la información directamente desde las tablas de la base de datos SQLite (progreso_consultas.db)
+    y construye un archivo Excel profesional (.xlsx) con 4 hojas:
+      1. RESUMEN EJECUTIVO BD (KPIs globales y desglose por Patio y Año desde SQLite)
+      2. BASE DE DATOS VEHICULOS (Todos los registros de historial_consultas con colores semáforo)
+      3. ALERTAS Y EMBARGOS (Registros con Embargo, Fiscalía, Prenda o Inconsistencia de Propietario)
+      4. AUDITORIA ACCESOS Y TOKENS (Sesiones y eventos registrados en SQLite)
+    Retorna: (ruta_archivo_generado, resumen_dict)
+    """
+    sync_scope_to_sqlite(scope=scope, patio=patio, anio=anio, log_cb=log_cb)
+
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    if not output_path:
+        suffix = scope
+        if scope == "PATIO" and patio:
+            suffix = patio.replace(" ", "_")
+        elif scope == "ANIO" and patio and anio:
+            suffix = f"{patio.replace(' ', '_')}_{anio.replace(' ', '_')}"
+        output_path = os.path.join(REPORTS_DIR, f"REPORTE_RUNT_SQLITE_{suffix}_{ts}.xlsx")
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    # Filtros SQL según alcance
+    where_clause = ""
+    params = []
+    if scope == "ANIO" and patio and anio:
+        where_clause = "WHERE patio = ? AND anio = ?"
+        params = [patio, anio]
+    elif scope == "PATIO" and patio:
+        where_clause = "WHERE patio = ?"
+        params = [patio]
+
+    # 1. Consultar Resumen Agrupado por Patio y Año desde SQLite
+    cur.execute(f"""
+        SELECT
+            patio,
+            anio,
+            COUNT(*) AS total_vehiculos,
+            SUM(CASE WHEN estado_consulta = 'COMPLETADO_CIUDADANO' THEN 1 ELSE 0 END) AS completados,
+            SUM(CASE WHEN estado_consulta = 'PENDIENTE' THEN 1 ELSE 0 END) AS pendientes,
+            SUM(CASE WHEN estado_consulta = 'INCONSISTENCIA_PROPIETARIO' THEN 1 ELSE 0 END) AS inconsistencias,
+            SUM(CASE WHEN estado_consulta = 'SIN_PROPIETARIO_CONSTANCIA' THEN 1 ELSE 0 END) AS sin_propietario,
+            SUM(CASE WHEN UPPER(COALESCE(tiene_embargo_limitacion, 'NO')) != 'NO'
+                       OR UPPER(COALESCE(detalle_limitacion, '')) LIKE '%EMBARGO%'
+                       OR UPPER(COALESCE(detalle_limitacion, '')) LIKE '%HURTO%'
+                     THEN 1 ELSE 0 END) AS con_embargo_alerta,
+            SUM(COALESCE(capturas_guardadas, 0)) AS total_capturas
+        FROM historial_consultas
+        {where_clause}
+        GROUP BY patio, anio
+        ORDER BY patio ASC, anio ASC
+    """, params)
+    resumen_rows = cur.fetchall()
+
+    # 2. Consultar todos los vehículos desde SQLite
+    cur.execute(f"""
+        SELECT
+            id, patio, anio, placa, clase, marca, linea, modelo,
+            tipo_doc, nro_doc, propietario,
+            estado_consulta, tiene_embargo_limitacion, detalle_limitacion,
+            soat_estado, rtm_estado, capturas_guardadas, ruta_expediente, fecha_actualizacion
+        FROM historial_consultas
+        {where_clause}
+        ORDER BY patio ASC, anio ASC, placa ASC
+    """, params)
+    vehiculos_rows = cur.fetchall()
+
+    # 3. Consultar Sesiones y Auditoría desde SQLite
+    sesiones_rows = []
+    bitacora_rows = []
+    try:
+        cur.execute("""
+            SELECT id, username, substr(token, 1, 14) || '...', fecha_inicio, fecha_expiracion,
+                   CASE WHEN activa = 1 THEN 'ACTIVA' ELSE 'CERRADA / EXPIRADA' END,
+                   COALESCE(motivo_cierre, '-')
+            FROM sesiones_token
+            ORDER BY id DESC LIMIT 500
+        """)
+        sesiones_rows = cur.fetchall()
+    except Exception:
+        pass
+
+    try:
+        cur.execute("""
+            SELECT id, username, evento, detalle, fecha_evento
+            FROM bitacora_accesos
+            ORDER BY id DESC LIMIT 1000
+        """)
+        bitacora_rows = cur.fetchall()
+    except Exception:
+        pass
+
+    conn.close()
+
+    # Construcción del libro Excel con estilos profesionales
+    wb = openpyxl.Workbook()
+    ws_res = wb.active
+    ws_res.title = "RESUMEN EJECUTIVO BD"
+    ws_veh = wb.create_sheet("BASE DE DATOS VEHICULOS")
+    ws_ale = wb.create_sheet("ALERTAS Y EMBARGOS")
+    ws_aud = wb.create_sheet("AUDITORIA SESIONES SQLITE")
+
+    # Paleta de estilos
+    header_fill = PatternFill("solid", fgColor="0F172A")
+    sub_fill = PatternFill("solid", fgColor="1E3A8A")
+    total_fill = PatternFill("solid", fgColor="E2E8F0")
+    header_font = Font(name="Segoe UI", size=10, bold=True, color="FFFFFF")
+    title_font = Font(name="Segoe UI", size=14, bold=True, color="0F172A")
+    bold_font = Font(name="Segoe UI", size=10, bold=True, color="0F172A")
+    reg_font = Font(name="Segoe UI", size=10, color="0F172A")
+
+    fill_ok = PatternFill("solid", fgColor="DCFCE7")
+    fill_emb = PatternFill("solid", fgColor="FEE2E2")
+    fill_inc = PatternFill("solid", fgColor="FFEDD5")
+    fill_pen = PatternFill("solid", fgColor="FEF9C3")
+    fill_sin = PatternFill("solid", fgColor="F1F5F9")
+
+    thin = Side(border_style="thin", color="CBD5E1")
+    border_cell = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    now_human = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # =========================================================================
+    # HOJA 1: RESUMEN EJECUTIVO BD
+    # =========================================================================
+    ws_res["A1"] = "REPORTE CONSOLIDADO DE VALIDACIÓN RUNT CIUDADANO (EXTRAÍDO DE SQLITE)"
+    ws_res["A1"].font = title_font
+    ws_res["A2"] = f"Fecha de generación: {now_human}  |  Base de Datos: {DB_PATH}  |  Alcance: {scope}"
+    ws_res["A2"].font = Font(name="Segoe UI", size=9, italic=True, color="475569")
+
+    res_headers = [
+        "PATIO", "AÑO RETENCIÓN", "TOTAL VEHÍCULOS",
+        "COMPLETADOS RUNT CIUDADANO", "PENDIENTES CON PROPIETARIO",
+        "CON EMBARGO / LIMITACIÓN", "INCONSISTENCIA PROPIETARIO",
+        "SIN PROPIETARIO (CONSTANCIA LEY 1730)", "TOTAL CAPTURAS ARCHIVADAS", "% AVANCE"
+    ]
+    ws_res.append([])
+    ws_res.append(res_headers)
+    for col_idx in range(1, len(res_headers) + 1):
+        c = ws_res.cell(row=4, column=col_idx)
+        c.fill = header_fill
+        c.font = header_font
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border = border_cell
+
+    tot_gen = [0, 0, 0, 0, 0, 0, 0]
+    row_num = 5
+    for r in resumen_rows:
+        p_nom, a_nom, t_veh, comp, pend, inc, sin_p, emb, caps = r
+        t_veh = t_veh or 0
+        comp = comp or 0
+        pend = pend or 0
+        inc = inc or 0
+        sin_p = sin_p or 0
+        emb = emb or 0
+        caps = caps or 0
+
+        tot_gen[0] += t_veh
+        tot_gen[1] += comp
+        tot_gen[2] += pend
+        tot_gen[3] += emb
+        tot_gen[4] += inc
+        tot_gen[5] += sin_p
+        tot_gen[6] += caps
+
+        procesados = comp + inc + sin_p
+        pct = f"{(procesados / t_veh * 100):.1f}%" if t_veh > 0 else "0.0%"
+
+        vals = [p_nom, a_nom, t_veh, comp, pend, emb, inc, sin_p, caps, pct]
+        ws_res.append(vals)
+        for col_idx in range(1, len(vals) + 1):
+            cell = ws_res.cell(row=row_num, column=col_idx)
+            cell.font = reg_font
+            cell.border = border_cell
+            cell.alignment = Alignment(horizontal="center" if col_idx > 2 else "left", vertical="center")
+        row_num += 1
+
+    # Fila de Totales
+    tot_proc = tot_gen[1] + tot_gen[4] + tot_gen[5]
+    pct_tot = f"{(tot_proc / tot_gen[0] * 100):.1f}%" if tot_gen[0] > 0 else "0.0%"
+    tot_vals = ["TOTAL GENERAL EN BASE DE DATOS", "-", tot_gen[0], tot_gen[1], tot_gen[2], tot_gen[3], tot_gen[4], tot_gen[5], tot_gen[6], pct_tot]
+    ws_res.append(tot_vals)
+    for col_idx in range(1, len(tot_vals) + 1):
+        cell = ws_res.cell(row=row_num, column=col_idx)
+        cell.fill = total_fill
+        cell.font = bold_font
+        cell.border = border_cell
+        cell.alignment = Alignment(horizontal="center" if col_idx > 2 else "left", vertical="center")
+
+    # =========================================================================
+    # HOJA 2 Y HOJA 3: BASE DE DATOS VEHÍCULOS Y ALERTAS/EMBARGOS
+    # =========================================================================
+    veh_headers = [
+        "ID BD", "PATIO", "AÑO RETENCIÓN", "PLACA", "CLASE", "MARCA", "LÍNEA", "MODELO",
+        "TIPO DOCUMENTO", "NRO DOCUMENTO", "PROPIETARIO REGISTRADO",
+        "ESTADO EXPEDIENTE", "¿EMBARGO / LIMITACIÓN?", "DETALLE LIMITACIÓN / NOVEDAD",
+        "ESTADO SOAT", "ESTADO RTM", "N° CAPTURAS", "RUTA EXPEDIENTE VEHICULAR", "FECHA ACTUALIZACIÓN BD"
+    ]
+
+    for sheet in (ws_veh, ws_ale):
+        sheet.append(veh_headers)
+        for col_idx in range(1, len(veh_headers) + 1):
+            c = sheet.cell(row=1, column=col_idx)
+            c.fill = header_fill
+            c.font = header_font
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            c.border = border_cell
+
+    r_veh_idx = 2
+    r_ale_idx = 2
+    for row in vehiculos_rows:
+        (
+            vid, pat, ani, pla, cla, mar, lin, mod,
+            tdoc, ndoc, prop, est, temb, dlim, soat, rtm, caps, ruta, f_act
+        ) = row
+
+        est_up = str(est or "").upper()
+        temb_up = str(temb or "NO").upper()
+        dlim_up = str(dlim or "").upper()
+
+        row_fill = fill_pen
+        is_alert = False
+        if "SI" in temb_up or "EMBARGO" in dlim_up or "HURTO" in dlim_up or "PRENDA" in temb_up or "GARANTIA" in dlim_up:
+            row_fill = fill_emb
+            is_alert = True
+        elif est_up == "COMPLETADO_CIUDADANO":
+            row_fill = fill_ok
+        elif est_up == "INCONSISTENCIA_PROPIETARIO":
+            row_fill = fill_inc
+            is_alert = True
+        elif est_up == "SIN_PROPIETARIO_CONSTANCIA":
+            row_fill = fill_sin
+
+        ws_veh.append(list(row))
+        for col_idx in range(1, len(veh_headers) + 1):
+            c = ws_veh.cell(row=r_veh_idx, column=col_idx)
+            c.fill = row_fill
+            c.font = reg_font
+            c.border = border_cell
+        r_veh_idx += 1
+
+        if is_alert:
+            ws_ale.append(list(row))
+            for col_idx in range(1, len(veh_headers) + 1):
+                c = ws_ale.cell(row=r_ale_idx, column=col_idx)
+                c.fill = row_fill
+                c.font = reg_font
+                c.border = border_cell
+            r_ale_idx += 1
+
+    # =========================================================================
+    # HOJA 4: AUDITORÍA DE SESIONES Y ACCESOS (SQLITE)
+    # =========================================================================
+    ws_aud["A1"] = "HISTORIAL DE SESIONES CON TOKEN (VIGENCIA 60 MINUTOS) - SQLITE"
+    ws_aud["A1"].font = bold_font
+    aud_sess_headers = ["ID SESIÓN", "USUARIO", "TOKEN (PREFIJO)", "FECHA INICIO", "FECHA EXPIRACIÓN (60 MIN)", "ESTADO", "MOTIVO CIERRE"]
+    ws_aud.append(aud_sess_headers)
+    for col_idx in range(1, len(aud_sess_headers) + 1):
+        c = ws_aud.cell(row=2, column=col_idx)
+        c.fill = sub_fill
+        c.font = header_font
+        c.border = border_cell
+
+    curr_aud_row = 3
+    for s_row in sesiones_rows:
+        ws_aud.append(list(s_row))
+        for col_idx in range(1, len(aud_sess_headers) + 1):
+            c = ws_aud.cell(row=curr_aud_row, column=col_idx)
+            c.font = reg_font
+            c.border = border_cell
+        curr_aud_row += 1
+
+    curr_aud_row += 2
+    ws_aud.cell(row=curr_aud_row, column=1, value="BITÁCORA DE EVENTOS DE SEGURIDAD Y ACCESOS - SQLITE").font = bold_font
+    curr_aud_row += 1
+    bit_headers = ["ID EVENTO", "USUARIO", "EVENTO", "DETALLE", "FECHA Y HORA"]
+    for col_idx, h_text in enumerate(bit_headers, start=1):
+        c = ws_aud.cell(row=curr_aud_row, column=col_idx, value=h_text)
+        c.fill = header_fill
+        c.font = header_font
+        c.border = border_cell
+    curr_aud_row += 1
+
+    for b_row in bitacora_rows:
+        for col_idx, val in enumerate(b_row, start=1):
+            c = ws_aud.cell(row=curr_aud_row, column=col_idx, value=val)
+            c.font = reg_font
+            c.border = border_cell
+        curr_aud_row += 1
+
+    # Ajustar ancho de columnas y activar autofiltros
+    for ws in (ws_res, ws_veh, ws_ale, ws_aud):
+        if ws in (ws_veh, ws_ale) and ws.max_row >= 1:
+            ws.auto_filter.ref = f"A1:{get_column_letter(ws.max_column)}{ws.max_row}"
+            ws.freeze_panes = "A2"
+        elif ws == ws_res and ws.max_row >= 4:
+            ws.freeze_panes = "A5"
+        for col in ws.columns:
+            max_len = 0
+            col_letter = get_column_letter(col[0].column)
+            for cell in col[:250]:
+                val_str = str(cell.value or "")
+                if len(val_str) > max_len:
+                    max_len = len(val_str)
+            ws.column_dimensions[col_letter].width = min(max(max_len + 4, 12), 48)
+
+    wb.save(output_path)
+
+    summary_info = {
+        "total_vehiculos": tot_gen[0],
+        "completados": tot_gen[1],
+        "pendientes": tot_gen[2],
+        "embargos": tot_gen[3],
+        "inconsistencias": tot_gen[4],
+        "sin_propietario": tot_gen[5],
+        "total_capturas": tot_gen[6],
+        "output_path": output_path
+    }
+    return output_path, summary_info
+

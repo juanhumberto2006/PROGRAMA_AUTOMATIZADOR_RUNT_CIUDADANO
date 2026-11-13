@@ -1,34 +1,39 @@
 # -*- coding: utf-8 -*-
 """
-Panel de Control Gráfico (GUI): Automatizador RUNT Ciudadano + Sistema de Autenticación SQLite (Token 60 Minutos).
-Características de Seguridad e Integración:
-1. Al iniciar o cerrar el programa, invalida cualquier sesión anterior en SQLite (siempre exige iniciar sesión).
-2. Login con validación de credenciales cifradas (PBKDF2-HMAC-SHA256), control de intentos fallidos y generación de Token.
-3. Token de sesión con expiración estricta de 60 minutos (cuenta regresiva en vivo en la barra superior).
-4. Si el token llega a 00:00 o el usuario presiona "Cerrar Sesión", pausa el lote, revoca el token en SQLite
-   y bloquea el panel regresando a la pantalla de inicio de sesión.
-5. Gestión de usuarios integrada (Crear / Cambiar contraseña en SQLite).
+Panel de Control Gráfico (GUI): Automatizador RUNT Ciudadano + Modo Ráfaga Multi-Pestaña (4-6 Canales Simultáneos)
++ Sistema de Autenticación SQLite (Token 60 Minutos) + Generador de Reportes Excel desde Base de Datos.
+
+Características clave:
+1. Seguridad SQLite: Login obligatorio al abrir/cerrar, contraseñas PBKDF2-HMAC-SHA256 y Token de 60 minutos.
+2. Modo Ráfaga Multi-Pestaña (Paralelo): Abre hasta 6 pestañas aisladas del RUNT al mismo tiempo, precarga
+   las placas y sus respectivos CAPTCHAs simultáneamente, y salta automáticamente el foco de un Captcha al
+   siguiente al presionar Enter mientras los demás canales toman las 5 capturas en segundo plano.
+3. Actualización instantánea en memoria + SQLite sin bloquear la tabla.
+4. Generador de Reportes Excel (.xlsx) de 4 hojas conectado directamente a la base de datos SQLite.
 """
 
 import os
 import io
 import queue
+import asyncio
 import threading
 import subprocess
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 from PIL import Image, ImageTk
 
 import auth_manager
 import scanner_patios
-from bot_playwright_runt import RuntCiudadanoBot
+from bot_playwright_runt import RuntParallelCluster
 
 
 class AutomatizadorRuntGUI:
+    MAX_CHANNELS = 4  # Tarjetas simultáneas visibles en el panel derecho (soporta 1 a 4 en vista directa)
+
     def __init__(self, root):
         self.root = root
         self.root.title("Automatizador Oficial de Expedientes RUNT Ciudadano - Acceso Seguro")
-        self.root.geometry("1280x800")
+        self.root.geometry("1360x840")
         self.root.configure(bg="#0f172a")
 
         # Al abrir el programa, invalidar todas las sesiones previas para exigir siempre login nuevo
@@ -43,21 +48,25 @@ class AutomatizadorRuntGUI:
         self.vehicles = []
         self.stats = {}
         self.current_index = None
-
-        self.cmd_queue = queue.Queue()
         self.is_running_batch = False
         self.is_paused = False
-        self.captcha_photo = None
 
-        # Contenedores principales (Login vs Dashboard)
+        # Contenedores de vistas
         self.login_container = None
         self.dashboard_container = None
 
-        self._setup_styles()
+        # Widgets de los canales paralelos
+        self.slot_widgets = {}
+        self.slot_photos = {}
+        self.slot_ready_flags = {}
 
-        # Iniciar hilo trabajador de Playwright en segundo plano
-        self.worker_thread = threading.Thread(target=self._playwright_worker_loop, daemon=True)
+        # Cola de comandos hacia el hilo asíncrono de Playwright
+        self.cmd_queue = queue.Queue()
+        self.cluster = None
+        self.worker_thread = threading.Thread(target=self._async_worker_thread_entry, daemon=True)
         self.worker_thread.start()
+
+        self._setup_styles()
 
         # Al cerrar la ventana con la X, revocar el token activo en SQLite
         self.root.protocol("WM_DELETE_WINDOW", self._on_close_window)
@@ -100,7 +109,6 @@ class AutomatizadorRuntGUI:
         self.login_container = tk.Frame(self.root, bg="#0f172a")
         self.login_container.pack(fill=tk.BOTH, expand=True)
 
-        # Tarjeta central de Login
         card = tk.Frame(
             self.login_container, bg="#1e293b",
             padx=38, pady=34,
@@ -130,7 +138,6 @@ class AutomatizadorRuntGUI:
             )
             lbl_alert.pack(fill=tk.X, pady=(0, 14))
 
-        # Usuario
         tk.Label(
             card, text="Usuario:", bg="#1e293b", fg="#e2e8f0",
             font=("Segoe UI", 10, "bold")
@@ -143,7 +150,6 @@ class AutomatizadorRuntGUI:
         self.ent_login_user.pack(fill=tk.X, ipady=6, pady=(4, 14))
         self.ent_login_user.bind("<Return>", lambda e: self.ent_login_pwd.focus_set())
 
-        # Contraseña
         tk.Label(
             card, text="Contraseña:", bg="#1e293b", fg="#e2e8f0",
             font=("Segoe UI", 10, "bold")
@@ -176,34 +182,55 @@ class AutomatizadorRuntGUI:
         )
         self.lbl_login_status.pack(fill=tk.X, pady=(4, 8))
 
-        btn_login = tk.Button(
+        self.btn_login = tk.Button(
             card, text="INGRESAR AL SISTEMA ➔",
             bg="#0284c7", fg="#ffffff",
             font=("Segoe UI", 11, "bold"),
             relief=tk.FLAT, pady=10, cursor="hand2",
             command=self._attempt_login
         )
-        btn_login.pack(fill=tk.X, pady=(6, 4))
+        self.btn_login.pack(fill=tk.X, pady=(6, 4))
+        self._login_in_progress = False
 
         self.ent_login_user.focus_set()
 
     def _attempt_login(self):
+        if getattr(self, "_login_in_progress", False):
+            return
         user = self.ent_login_user.get().strip()
         pwd = self.ent_login_pwd.get()
 
-        ok, msg, session_data = auth_manager.authenticate_user(user, pwd)
-        if not ok:
-            self.lbl_login_status.configure(text=f"⚠ {msg}", fg="#f87171")
-            return
+        self._login_in_progress = True
+        self.lbl_login_status.configure(
+            text="⏳ Verificando credenciales e ingresando al sistema...",
+            fg="#38bdf8"
+        )
+        self.btn_login.configure(text="⏳ INGRESANDO...", state="disabled", bg="#0369a1")
+        self.root.update_idletasks()
 
-        self.session = session_data
-        self._show_dashboard_view()
+        def _bg_auth():
+            ok, msg, session_data = auth_manager.authenticate_user(user, pwd)
+
+            def _on_auth_done():
+                self._login_in_progress = False
+                if not ok:
+                    if hasattr(self, "lbl_login_status") and self.lbl_login_status.winfo_exists():
+                        self.lbl_login_status.configure(text=f"⚠ {msg}", fg="#f87171")
+                    if hasattr(self, "btn_login") and self.btn_login.winfo_exists():
+                        self.btn_login.configure(text="INGRESAR AL SISTEMA ➔", state="normal", bg="#0284c7")
+                    return
+
+                if hasattr(self, "lbl_login_status") and self.lbl_login_status.winfo_exists():
+                    self.lbl_login_status.configure(text="✅ Acceso autorizado. Cargando panel...", fg="#4ade80")
+                self.root.update_idletasks()
+                self.session = session_data
+                self._show_dashboard_view()
+
+            self.root.after(0, _on_auth_done)
+
+        threading.Thread(target=_bg_auth, daemon=True).start()
 
     def _start_session_countdown(self):
-        """
-        Verifica cada segundo en SQLite que el token siga activo y actualiza el reloj de 60:00 a 00:00.
-        Si expira, detiene cualquier lote y bloquea el sistema enviando al Login.
-        """
         if not self.session:
             return
 
@@ -230,6 +257,8 @@ class AutomatizadorRuntGUI:
     def _force_logout_due_to_expiration(self, reason_msg):
         self.is_paused = True
         self.is_running_batch = False
+        if self.cluster:
+            self.cluster.is_paused = True
         if self.session:
             auth_manager.logout_session(self.session.get("token"), "EXPIRACION_AUTOMATICA_60_MIN")
         self.session = None
@@ -240,13 +269,14 @@ class AutomatizadorRuntGUI:
         self._show_login_view(info_msg="Tu sesión anterior cumplió los 60 minutos de validez. Inicia sesión nuevamente para continuar.")
 
     def _manual_logout(self):
-        if not self.session:
-            return
-        if not messagebox.askyesno("Cerrar Sesión", "¿Deseas cerrar tu sesión actual?\nSi hay un lote en ejecución se pausará inmediatamente."):
+        if not messagebox.askyesno("Cerrar Sesión", "¿Deseas cerrar tu sesión actual y bloquear el sistema?"):
             return
         self.is_paused = True
         self.is_running_batch = False
-        auth_manager.logout_session(self.session.get("token"), "CIERRE_SESION_MANUAL_USUARIO")
+        if self.cluster:
+            self.cluster.is_paused = True
+        if self.session:
+            auth_manager.logout_session(self.session.get("token"), "CIERRE_MANUAL_BOTON_SALIR")
         self.session = None
         self._show_login_view(info_msg="Has cerrado sesión correctamente. Tu token fue invalidado en la base de datos.")
 
@@ -294,7 +324,7 @@ class AutomatizadorRuntGUI:
         ).pack(fill=tk.X)
 
     # =========================================================================
-    # 2. PANEL PRINCIPAL DE CONTROL DE PATIOS (DASHBOARD AUTENTICADO)
+    # 2. PANEL PRINCIPAL DE CONTROL DE PATIOS + MODO RÁFAGA MULTI-PESTAÑA
     # =========================================================================
     def _show_dashboard_view(self):
         if self.login_container:
@@ -302,13 +332,13 @@ class AutomatizadorRuntGUI:
             self.login_container = None
 
         self.root.title(
-            f"Automatizador Oficial RUNT Ciudadano - Sesión Activa: {self.session['nombre_completo']} ({self.session['username']})"
+            f"Automatizador Oficial RUNT Ciudadano [Modo Ráfaga Multi-Pestaña] - Sesión: {self.session['nombre_completo']} ({self.session['username']})"
         )
 
         self.dashboard_container = tk.Frame(self.root, bg="#0f172a")
         self.dashboard_container.pack(fill=tk.BOTH, expand=True)
 
-        # Barra superior de Sesión y Seguridad (Token + Cuenta regresiva 60 min + Cerrar Sesión)
+        # Barra superior de Sesión y Seguridad
         session_bar = tk.Frame(self.dashboard_container, bg="#090d16", padx=14, pady=6)
         session_bar.pack(fill=tk.X)
 
@@ -341,38 +371,46 @@ class AutomatizadorRuntGUI:
         )
         self.lbl_session_timer.pack(side=tk.RIGHT, padx=14)
 
-        # 1. Barra de título y selectores de Patio / Año
-        top_frame = tk.Frame(self.dashboard_container, bg="#1e293b", padx=16, pady=10)
-        top_frame.pack(fill=tk.X, padx=12, pady=(8, 6))
+        # 1. Barra de título y selectores de Patio / Año / Reportes
+        top_frame = tk.Frame(self.dashboard_container, bg="#1e293b", padx=14, pady=8)
+        top_frame.pack(fill=tk.X, padx=12, pady=(6, 4))
 
         tk.Label(
             top_frame,
-            text="AUTOMATIZADOR DE EXPEDIENTES RUNT CIUDADANO",
+            text="AUTOMATIZADOR RUNT CIUDADANO",
             bg="#1e293b", fg="#f8fafc",
-            font=("Segoe UI", 14, "bold")
-        ).pack(side=tk.LEFT, padx=(0, 20))
+            font=("Segoe UI", 13, "bold")
+        ).pack(side=tk.LEFT, padx=(0, 16))
 
         tk.Label(top_frame, text="Patio:", bg="#1e293b", fg="#cbd5e1", font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
-        self.cmb_patio = ttk.Combobox(top_frame, state="readonly", width=30, font=("Segoe UI", 10))
-        self.cmb_patio.pack(side=tk.LEFT, padx=(6, 14))
+        self.cmb_patio = ttk.Combobox(top_frame, state="readonly", width=26, font=("Segoe UI", 10))
+        self.cmb_patio.pack(side=tk.LEFT, padx=(6, 12))
         self.cmb_patio.bind("<<ComboboxSelected>>", self._on_patio_selected)
 
         tk.Label(top_frame, text="Año Retención:", bg="#1e293b", fg="#cbd5e1", font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
-        self.cmb_anio = ttk.Combobox(top_frame, state="readonly", width=14, font=("Segoe UI", 10))
-        self.cmb_anio.pack(side=tk.LEFT, padx=(6, 14))
+        self.cmb_anio = ttk.Combobox(top_frame, state="readonly", width=12, font=("Segoe UI", 10))
+        self.cmb_anio.pack(side=tk.LEFT, padx=(6, 12))
         self.cmb_anio.bind("<<ComboboxSelected>>", self._on_anio_selected)
 
         btn_refresh = tk.Button(
             top_frame, text="🔄 Actualizar Escaneo",
-            bg="#334155", fg="#f8fafc", font=("Segoe UI", 10, "bold"),
-            relief=tk.FLAT, padx=12, pady=4, cursor="hand2",
+            bg="#334155", fg="#f8fafc", font=("Segoe UI", 9, "bold"),
+            relief=tk.FLAT, padx=10, pady=4, cursor="hand2",
             command=self._scan_current_selection
         )
-        btn_refresh.pack(side=tk.LEFT, padx=6)
+        btn_refresh.pack(side=tk.LEFT, padx=4)
+
+        btn_report_top = tk.Button(
+            top_frame, text="📊 Generar Reporte BD (Excel)",
+            bg="#0284c7", fg="#ffffff", font=("Segoe UI", 9, "bold"),
+            relief=tk.FLAT, padx=12, pady=4, cursor="hand2",
+            command=self._open_report_generator_dialog
+        )
+        btn_report_top.pack(side=tk.LEFT, padx=4)
 
         # 2. Panel de tarjetas de indicadores (KPIs)
         kpi_frame = tk.Frame(self.dashboard_container, bg="#0f172a")
-        kpi_frame.pack(fill=tk.X, padx=12, pady=4)
+        kpi_frame.pack(fill=tk.X, padx=12, pady=3)
 
         self.kpi_vars = {
             "total": tk.StringVar(value="0"),
@@ -393,14 +431,14 @@ class AutomatizadorRuntGUI:
         ]
 
         for label_txt, key, color in kpi_specs:
-            card = tk.Frame(kpi_frame, bg="#1e293b", padx=14, pady=8, highlightbackground="#334155", highlightthickness=1)
-            card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4)
-            tk.Label(card, textvariable=self.kpi_vars[key], bg="#1e293b", fg=color, font=("Segoe UI", 19, "bold")).pack(anchor="w")
-            tk.Label(card, text=label_txt, bg="#1e293b", fg="#cbd5e1", font=("Segoe UI", 9)).pack(anchor="w")
+            card = tk.Frame(kpi_frame, bg="#1e293b", padx=12, pady=6, highlightbackground="#334155", highlightthickness=1)
+            card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=3)
+            tk.Label(card, textvariable=self.kpi_vars[key], bg="#1e293b", fg=color, font=("Segoe UI", 17, "bold")).pack(anchor="w")
+            tk.Label(card, text=label_txt, bg="#1e293b", fg="#cbd5e1", font=("Segoe UI", 8)).pack(anchor="w")
 
-        # 3. Panel Central Dividido: Izquierda (Tabla) | Derecha (Consola + Captcha Turbo)
+        # 3. Panel Central Dividido: Izquierda (Tabla) | Derecha (4 Canales Simultáneos de Captcha Ráfaga)
         mid_frame = tk.Frame(self.dashboard_container, bg="#0f172a")
-        mid_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=6)
+        mid_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=5)
 
         left_frame = tk.Frame(mid_frame, bg="#1e293b", padx=8, pady=8)
         left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
@@ -421,7 +459,7 @@ class AutomatizadorRuntGUI:
                 bg="#1e293b", fg="#f8fafc", selectcolor="#0f172a",
                 activebackground="#1e293b", activeforeground="#38bdf8",
                 font=("Segoe UI", 9), command=self._populate_tree
-            ).pack(side=tk.LEFT, padx=8)
+            ).pack(side=tk.LEFT, padx=6)
 
         cols = ("placa", "tipo_doc", "nro_doc", "propietario", "estado", "embargo", "imgs")
         self.tree = ttk.Treeview(left_frame, columns=cols, show="headings", selectmode="browse")
@@ -433,13 +471,13 @@ class AutomatizadorRuntGUI:
         self.tree.heading("embargo", text="EMBARGO / LIMITACIÓN")
         self.tree.heading("imgs", text="CAPTURAS")
 
-        self.tree.column("placa", width=80, anchor="center")
-        self.tree.column("tipo_doc", width=120, anchor="center")
-        self.tree.column("nro_doc", width=110, anchor="center")
-        self.tree.column("propietario", width=230, anchor="w")
-        self.tree.column("estado", width=155, anchor="center")
-        self.tree.column("embargo", width=165, anchor="w")
-        self.tree.column("imgs", width=75, anchor="center")
+        self.tree.column("placa", width=75, anchor="center")
+        self.tree.column("tipo_doc", width=115, anchor="center")
+        self.tree.column("nro_doc", width=105, anchor="center")
+        self.tree.column("propietario", width=215, anchor="w")
+        self.tree.column("estado", width=150, anchor="center")
+        self.tree.column("embargo", width=155, anchor="w")
+        self.tree.column("imgs", width=70, anchor="center")
 
         self.tree.tag_configure("PENDIENTE", foreground="#fde047")
         self.tree.tag_configure("COMPLETADO_CIUDADANO", foreground="#4ade80")
@@ -453,117 +491,287 @@ class AutomatizadorRuntGUI:
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
 
-        # Panel Derecho
-        right_frame = tk.Frame(mid_frame, bg="#1e293b", width=390, padx=14, pady=12)
+        # =====================================================================
+        # PANEL DERECHO: MODO RÁFAGA MULTI-PESTAÑA (4 CANALES SIMULTÁNEOS)
+        # =====================================================================
+        right_frame = tk.Frame(mid_frame, bg="#1e293b", width=460, padx=12, pady=10)
         right_frame.pack(side=tk.RIGHT, fill=tk.Y)
         right_frame.pack_propagate(False)
 
+        header_r = tk.Frame(right_frame, bg="#1e293b")
+        header_r.pack(fill=tk.X, pady=(0, 6))
+
         tk.Label(
-            right_frame, text="PANEL DE EJECUCIÓN Y CAPTCHA TURBO",
+            header_r, text="⚡ MODO RÁFAGA MULTI-PESTAÑA",
             bg="#1e293b", fg="#38bdf8", font=("Segoe UI", 11, "bold")
-        ).pack(anchor="w", pady=(0, 8))
+        ).pack(side=tk.LEFT)
 
-        self.lbl_active_veh = tk.Label(
-            right_frame,
-            text="Vehículo en turno: Ninguno",
-            bg="#0f172a", fg="#f8fafc", font=("Segoe UI", 10, "bold"),
-            padx=10, pady=8, anchor="w", justify="left", wraplength=350
+        tk.Label(header_r, text="Canales:", bg="#1e293b", fg="#cbd5e1", font=("Segoe UI", 9, "bold")).pack(side=tk.RIGHT, padx=(6, 4))
+        self.cmb_channels = ttk.Combobox(
+            header_r, state="readonly", width=14, font=("Segoe UI", 9),
+            values=["4 Pestañas (Turbo)", "3 Pestañas", "2 Pestañas", "1 Pestaña"]
         )
-        self.lbl_active_veh.pack(fill=tk.X, pady=(0, 10))
+        self.cmb_channels.set("4 Pestañas (Turbo)")
+        self.cmb_channels.pack(side=tk.RIGHT)
 
+        # Botonera de control de Lote Ráfaga
         btn_grid = tk.Frame(right_frame, bg="#1e293b")
-        btn_grid.pack(fill=tk.X, pady=(0, 10))
+        btn_grid.pack(fill=tk.X, pady=(0, 6))
 
         self.btn_start = tk.Button(
-            btn_grid, text="▶ INICIAR LOTE AUTOMÁTICO",
-            bg="#16a34a", fg="#ffffff", font=("Segoe UI", 10, "bold"),
-            relief=tk.FLAT, pady=8, cursor="hand2",
+            btn_grid, text="⚡ INICIAR RÁFAGA MULTI-PESTAÑA (DESDE SELECCIÓN)",
+            bg="#16a34a", fg="#ffffff", font=("Segoe UI", 9, "bold"),
+            relief=tk.FLAT, pady=7, cursor="hand2",
             command=self._start_batch_process
         )
-        self.btn_start.pack(fill=tk.X, pady=3)
+        self.btn_start.pack(fill=tk.X, pady=2)
+
+        row_actions = tk.Frame(btn_grid, bg="#1e293b")
+        row_actions.pack(fill=tk.X, pady=2)
 
         self.btn_single = tk.Button(
-            btn_grid, text="🎯 Consultar Solo Placa Seleccionada",
-            bg="#2563eb", fg="#ffffff", font=("Segoe UI", 10, "bold"),
-            relief=tk.FLAT, pady=6, cursor="hand2",
+            row_actions, text="🎯 Solo Placa Seleccionada",
+            bg="#2563eb", fg="#ffffff", font=("Segoe UI", 8, "bold"),
+            relief=tk.FLAT, pady=5, cursor="hand2",
             command=self._run_selected_single
         )
-        self.btn_single.pack(fill=tk.X, pady=3)
-
-        row_pause = tk.Frame(btn_grid, bg="#1e293b")
-        row_pause.pack(fill=tk.X, pady=3)
+        self.btn_single.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3))
 
         self.btn_pause = tk.Button(
-            row_pause, text="⏸ Pausar Lote",
-            bg="#d97706", fg="#ffffff", font=("Segoe UI", 9, "bold"),
+            row_actions, text="⏸ Pausar Ráfaga",
+            bg="#d97706", fg="#ffffff", font=("Segoe UI", 8, "bold"),
             relief=tk.FLAT, pady=5, cursor="hand2",
             command=self._toggle_pause
         )
-        self.btn_pause.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        self.btn_pause.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=3)
 
         self.btn_open_folder = tk.Button(
-            row_pause, text="📂 Abrir EXPEDIENTE VEHICULAR",
-            bg="#475569", fg="#ffffff", font=("Segoe UI", 9, "bold"),
+            row_actions, text="📂 Expediente",
+            bg="#475569", fg="#ffffff", font=("Segoe UI", 8, "bold"),
             relief=tk.FLAT, pady=5, cursor="hand2",
             command=self._open_selected_expediente
         )
-        self.btn_open_folder.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(4, 0))
+        self.btn_open_folder.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(3, 0))
 
-        cap_box = tk.Frame(right_frame, bg="#0f172a", padx=10, pady=10, highlightbackground="#38bdf8", highlightthickness=1)
-        cap_box.pack(fill=tk.X, pady=(6, 10))
-
+        # Instrucción breve de uso de Ráfaga
         tk.Label(
-            cap_box,
-            text="VISTA RÁPIDA DE CAPTCHA (Opcional: digita aquí + Enter\no escríbelo directo en la ventana de Chrome):",
-            bg="#0f172a", fg="#cbd5e1", font=("Segoe UI", 8), justify="left"
-        ).pack(anchor="w", pady=(0, 6))
+            right_frame,
+            text="Escribe el Captcha y presiona Enter ↵: el cursor salta al instante al siguiente\ncanal listo mientras los demás guardan las 5 capturas en segundo plano.",
+            bg="#1e293b", fg="#94a3b8", font=("Segoe UI", 8), justify="left"
+        ).pack(anchor="w", pady=(0, 4))
 
-        self.lbl_captcha_img = tk.Label(
-            cap_box, text="[El Captcha aparecerá aquí al cargar la placa]",
-            bg="#ffffff", fg="#475569", height=3, font=("Segoe UI", 9)
-        )
-        self.lbl_captcha_img.pack(fill=tk.X, pady=(0, 8))
+        # Contenedor de las 4 Tarjetas de Canales Simultáneos
+        slots_container = tk.Frame(right_frame, bg="#1e293b")
+        slots_container.pack(fill=tk.X, pady=(0, 6))
 
-        entry_row = tk.Frame(cap_box, bg="#0f172a")
-        entry_row.pack(fill=tk.X)
+        self.slot_widgets = {}
+        self.slot_photos = {}
+        self.slot_ready_flags = {}
 
-        self.ent_captcha = tk.Entry(
-            entry_row, font=("Consolas", 15, "bold"),
-            bg="#1e293b", fg="#38bdf8", insertbackground="#ffffff", width=12, justify="center"
-        )
-        self.ent_captcha.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        self.ent_captcha.bind("<Return>", lambda e: self._send_captcha_from_entry())
+        for s_id in range(self.MAX_CHANNELS):
+            card_s = tk.Frame(
+                slots_container, bg="#0f172a", padx=8, pady=5,
+                highlightbackground="#334155", highlightthickness=1
+            )
+            card_s.pack(fill=tk.X, pady=3)
 
-        tk.Button(
-            entry_row, text="Enviar ↵",
-            bg="#0284c7", fg="#ffffff", font=("Segoe UI", 10, "bold"),
-            relief=tk.FLAT, padx=12, cursor="hand2",
-            command=self._send_captcha_from_entry
-        ).pack(side=tk.RIGHT)
+            top_s = tk.Frame(card_s, bg="#0f172a")
+            top_s.pack(fill=tk.X)
 
+            lbl_title = tk.Label(
+                top_s, text=f"CANAL #{s_id + 1}: En espera",
+                bg="#0f172a", fg="#e2e8f0", font=("Segoe UI", 9, "bold")
+            )
+            lbl_title.pack(side=tk.LEFT)
+
+            lbl_state = tk.Label(
+                top_s, text="Inactivo",
+                bg="#0f172a", fg="#94a3b8", font=("Segoe UI", 8, "bold")
+            )
+            lbl_state.pack(side=tk.RIGHT)
+
+            body_s = tk.Frame(card_s, bg="#0f172a")
+            body_s.pack(fill=tk.X, pady=(3, 0))
+
+            lbl_img = tk.Label(
+                body_s, text="[Captcha Canal #" + str(s_id + 1) + "]",
+                bg="#ffffff", fg="#64748b", width=24, height=2, font=("Segoe UI", 8)
+            )
+            lbl_img.pack(side=tk.LEFT, padx=(0, 8))
+
+            ent_cap = tk.Entry(
+                body_s, font=("Consolas", 14, "bold"),
+                bg="#1e293b", fg="#38bdf8", insertbackground="#ffffff",
+                width=9, justify="center", relief=tk.FLAT,
+                highlightthickness=1, highlightbackground="#475569"
+            )
+            ent_cap.pack(side=tk.LEFT, ipady=4, padx=(0, 5))
+            ent_cap.bind("<Return>", lambda e, sid=s_id: self._submit_slot_captcha(sid))
+            ent_cap.bind("<Down>", lambda e, sid=s_id: self._focus_next_ready_slot(sid))
+            ent_cap.bind("<Up>", lambda e, sid=s_id: self._focus_prev_slot(sid))
+
+            btn_send = tk.Button(
+                body_s, text="Enviar ↵",
+                bg="#0284c7", fg="#ffffff", font=("Segoe UI", 8, "bold"),
+                relief=tk.FLAT, padx=8, pady=4, cursor="hand2",
+                command=lambda sid=s_id: self._submit_slot_captcha(sid)
+            )
+            btn_send.pack(side=tk.LEFT, padx=(0, 4))
+
+            btn_reload = tk.Button(
+                body_s, text="🔄",
+                bg="#334155", fg="#e2e8f0", font=("Segoe UI", 8),
+                relief=tk.FLAT, padx=5, pady=4, cursor="hand2",
+                command=lambda sid=s_id: self._refresh_slot_captcha(sid)
+            )
+            btn_reload.pack(side=tk.LEFT)
+
+            self.slot_widgets[s_id] = {
+                "card": card_s,
+                "lbl_title": lbl_title,
+                "lbl_state": lbl_state,
+                "lbl_img": lbl_img,
+                "ent_cap": ent_cap
+            }
+            self.slot_ready_flags[s_id] = False
+
+        # Barra rápida para cambiar tipo de documento y reintentar placa seleccionada
         retry_box = tk.Frame(right_frame, bg="#1e293b")
-        retry_box.pack(fill=tk.X, pady=(2, 8))
-        tk.Label(retry_box, text="Cambiar Tipo Doc si falla:", bg="#1e293b", fg="#94a3b8", font=("Segoe UI", 8)).pack(side=tk.LEFT)
-        for doc_opt, short_lbl in [("Cédula de Extranjería", "Probar C.E."), ("NIT", "Probar NIT"), ("Pasaporte", "Probar PA")]:
+        retry_box.pack(fill=tk.X, pady=(2, 4))
+        tk.Label(retry_box, text="Probar otro Doc en placa seleccionada:", bg="#1e293b", fg="#94a3b8", font=("Segoe UI", 8)).pack(side=tk.LEFT)
+        for doc_opt, short_lbl in [("Cédula de Extranjería", "C.E."), ("NIT", "NIT"), ("Pasaporte", "PA")]:
             tk.Button(
                 retry_box, text=short_lbl, bg="#334155", fg="#e2e8f0",
-                font=("Segoe UI", 8), relief=tk.FLAT, padx=6, pady=2,
+                font=("Segoe UI", 8), relief=tk.FLAT, padx=6, pady=1,
                 command=lambda d=doc_opt: self._retry_with_doc_type(d)
-            ).pack(side=tk.LEFT, padx=3)
+            ).pack(side=tk.LEFT, padx=2)
 
-        tk.Label(right_frame, text="Bitácora de Ejecución en Vivo:", bg="#1e293b", fg="#cbd5e1", font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        tk.Label(right_frame, text="Bitácora de Ejecución Multi-Canal:", bg="#1e293b", fg="#cbd5e1", font=("Segoe UI", 8, "bold")).pack(anchor="w")
         self.txt_log = tk.Text(
             right_frame, bg="#0f172a", fg="#e2e8f0",
-            font=("Consolas", 9), height=12, state="disabled", wrap="word"
+            font=("Consolas", 8), height=6, state="disabled", wrap="word"
         )
-        self.txt_log.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
+        self.txt_log.pack(fill=tk.BOTH, expand=True, pady=(2, 0))
 
-        # Iniciar contador regresivo del Token de 60 minutos y cargar los patios
+        # Iniciar contador regresivo del Token de 60 minutos y cargar los patios sin congelar la interfaz
         self._start_session_countdown()
-        self._load_patios()
+        self.log_message("⏳ Cargando patios y sincronizando expedientes...")
+        self.root.update_idletasks()
+        self.root.after(40, self._load_patios)
 
     # =========================================================================
-    # 3. VALIDACIÓN DE TOKEN ANTES DE CADA ACCIÓN Y LÓGICA OPERATIVA
+    # 3. COORDINACIÓN MULTI-CANAL DE CAPTCHAS Y FOCO INSTANTÁNEO
+    # =========================================================================
+    def _get_selected_num_channels(self) -> int:
+        if not hasattr(self, "cmb_channels"):
+            return 4
+        val = self.cmb_channels.get()
+        for n in (4, 3, 2, 1):
+            if str(n) in val:
+                return n
+        return 4
+
+    def _on_slot_state_update(self, slot_id: int, state: dict):
+        """
+        Actualiza visualmente la tarjeta del Canal #slot_id en la GUI (imagen de captcha, placa, estado)
+        y si ningún otro canal listo tiene el foco, enfoca automáticamente este canal.
+        """
+        def _draw():
+            if slot_id not in self.slot_widgets:
+                return
+            w = self.slot_widgets[slot_id]
+            if not w["card"].winfo_exists():
+                return
+
+            placa = state.get("placa", "-")
+            doc_info = state.get("doc_info", "-")
+            status_text = state.get("status_text", "")
+            status_color = state.get("status_color", "#94a3b8")
+            cap_bytes = state.get("captcha_bytes")
+            ready = bool(state.get("ready_for_captcha", False))
+
+            self.slot_ready_flags[slot_id] = ready
+
+            if placa and placa != "-":
+                w["lbl_title"].configure(text=f"CANAL #{slot_id + 1}: {placa}  ({doc_info})", fg="#38bdf8" if ready else "#e2e8f0")
+            else:
+                w["lbl_title"].configure(text=f"CANAL #{slot_id + 1}: Libre", fg="#94a3b8")
+
+            w["lbl_state"].configure(text=status_text, fg=status_color)
+            w["card"].configure(highlightbackground="#4ade80" if ready else "#334155")
+
+            if cap_bytes:
+                try:
+                    pil_img = Image.open(io.BytesIO(cap_bytes))
+                    pil_img = pil_img.resize((175, 44), Image.Resampling.LANCZOS)
+                    photo = ImageTk.PhotoImage(pil_img)
+                    self.slot_photos[slot_id] = photo
+                    w["lbl_img"].configure(image=photo, text="", width=175, height=44)
+                except Exception:
+                    w["lbl_img"].configure(image="", text="[Ver en Chrome]", width=24, height=2)
+            elif ready:
+                w["lbl_img"].configure(image="", text="[Ver Captcha en Chrome]", width=24, height=2)
+            else:
+                w["lbl_img"].configure(image="", text=f"[{status_text[:22]}...]", width=24, height=2)
+
+            if ready:
+                w["ent_cap"].delete(0, tk.END)
+                # Si el usuario no está escribiendo ya en otro canal que esté listo, darle foco inmediato a este
+                focused_widget = self.root.focus_get()
+                other_ready_focused = False
+                for other_id, other_w in self.slot_widgets.items():
+                    if other_id != slot_id and focused_widget == other_w["ent_cap"] and self.slot_ready_flags.get(other_id):
+                        other_ready_focused = True
+                        break
+                if not other_ready_focused:
+                    w["ent_cap"].focus_set()
+
+        self.root.after(0, _draw)
+
+    def _submit_slot_captcha(self, slot_id: int):
+        if not self._ensure_authenticated():
+            return
+        if slot_id not in self.slot_widgets:
+            return
+        w = self.slot_widgets[slot_id]
+        txt = w["ent_cap"].get().strip()
+        if not txt:
+            return
+
+        w["ent_cap"].delete(0, tk.END)
+        self.slot_ready_flags[slot_id] = False
+        w["card"].configure(highlightbackground="#38bdf8")
+        w["lbl_state"].configure(text="⏳ Consultando y capturando...", fg="#38bdf8")
+
+        if self.cluster:
+            self.cluster.route_captcha_to_slot(slot_id, txt)
+
+        # Saltar instantáneamente al siguiente canal que ya tenga su Captcha listo
+        self._focus_next_ready_slot(slot_id)
+
+    def _refresh_slot_captcha(self, slot_id: int):
+        if not self._ensure_authenticated():
+            return
+        if self.cluster:
+            self.cluster.route_captcha_to_slot(slot_id, "__REFRESH_CAPTCHA__")
+
+    def _focus_next_ready_slot(self, current_slot_id: int):
+        # 1. Buscar primero el siguiente canal con captcha listo (ready_for_captcha == True)
+        for offset in range(1, self.MAX_CHANNELS + 1):
+            cand = (current_slot_id + offset) % self.MAX_CHANNELS
+            if self.slot_ready_flags.get(cand):
+                self.slot_widgets[cand]["ent_cap"].focus_set()
+                return
+        # 2. Si ninguno está marcado como listo aún, pasar al siguiente canal en orden
+        nxt = (current_slot_id + 1) % self.MAX_CHANNELS
+        self.slot_widgets[nxt]["ent_cap"].focus_set()
+
+    def _focus_prev_slot(self, current_slot_id: int):
+        prv = (current_slot_id - 1) % self.MAX_CHANNELS
+        self.slot_widgets[prv]["ent_cap"].focus_set()
+
+    # =========================================================================
+    # 4. ACTUALIZACIÓN EN VIVO SIN BLOQUEAR LA TABLA Y ESCANEO DE PATIOS
     # =========================================================================
     def _ensure_authenticated(self) -> bool:
         if not self.session:
@@ -583,23 +791,72 @@ class AutomatizadorRuntGUI:
                 self.txt_log.configure(state="disabled")
         self.root.after(0, _append)
 
-    def _update_captcha_preview(self, png_bytes):
-        def _draw():
-            if not hasattr(self, "lbl_captcha_img") or not self.lbl_captcha_img.winfo_exists():
-                return
-            if not png_bytes:
-                self.lbl_captcha_img.configure(image="", text="[Mira el Captcha en Chrome]")
-                return
-            try:
-                pil_img = Image.open(io.BytesIO(png_bytes))
-                pil_img = pil_img.resize((240, 62), Image.Resampling.LANCZOS)
-                self.captcha_photo = ImageTk.PhotoImage(pil_img)
-                self.lbl_captcha_img.configure(image=self.captcha_photo, text="", height=62)
-                self.ent_captcha.delete(0, tk.END)
-                self.ent_captcha.focus_set()
-            except Exception:
-                pass
-        self.root.after(0, _draw)
+    def _on_vehicle_completed_from_cluster(self, idx: int, v: dict, nuevo_estado: str, num_imgs: int, analysis: dict):
+        """
+        Se invoca cuando cualquiera de los canales paralelos termina un vehículo.
+        Guarda en SQLite y actualiza únicamente esa fila y los KPIs en memoria (0ms de espera).
+        """
+        placa = v["placa"]
+        tiene_emb = analysis.get("tiene_embargo", "NO")
+        det_lim = analysis.get("detalle_limitacion", "NINGUNO")
+        soat_est = analysis.get("soat_estado", "-")
+        rtm_est = analysis.get("rtm_estado", "-")
+
+        scanner_patios.save_consulta_result(
+            v["patio"], v["anio"], placa, v["propietario"],
+            v["tipo_doc_runt"], v["nro_doc"], nuevo_estado,
+            tiene_emb, det_lim, soat_est, rtm_est, num_imgs, v["exp_dir"]
+        )
+
+        if tiene_emb != "NO":
+            self.log_message(f"🚨 ALERTA {placa}: {det_lim}")
+        elif nuevo_estado == "COMPLETADO_CIUDADANO":
+            self.log_message(f"✅ {placa} completado sin limitaciones ({num_imgs} capturas).")
+
+        def _update_ui_fast():
+            if idx < len(self.vehicles):
+                prev_est = self.vehicles[idx]["estado"]
+                self.vehicles[idx]["estado"] = nuevo_estado
+                self.vehicles[idx]["num_imgs"] = num_imgs
+                self.vehicles[idx]["tiene_embargo"] = tiene_emb
+                self.vehicles[idx]["detalle_limitacion"] = det_lim
+                self.vehicles[idx]["soat_estado"] = soat_est
+                self.vehicles[idx]["rtm_estado"] = rtm_est
+
+                if prev_est == "PENDIENTE" and self.stats.get("pendientes_con_propietario", 0) > 0:
+                    self.stats["pendientes_con_propietario"] -= 1
+                if nuevo_estado == "COMPLETADO_CIUDADANO" and prev_est != "COMPLETADO_CIUDADANO":
+                    self.stats["completados_ciudadano"] = self.stats.get("completados_ciudadano", 0) + 1
+                elif nuevo_estado == "INCONSISTENCIA_PROPIETARIO" and prev_est != "INCONSISTENCIA_PROPIETARIO":
+                    self.stats["inconsistencias"] = self.stats.get("inconsistencias", 0) + 1
+                if tiene_emb != "NO":
+                    self.stats["con_embargo_alerta"] = self.stats.get("con_embargo_alerta", 0) + 1
+
+                self.kpi_vars["pendientes"].set(str(self.stats.get("pendientes_con_propietario", 0)))
+                self.kpi_vars["completados"].set(str(self.stats.get("completados_ciudadano", 0)))
+                self.kpi_vars["embargos"].set(str(self.stats.get("con_embargo_alerta", 0)))
+                self.kpi_vars["inconsistencias"].set(str(self.stats.get("inconsistencias", 0)))
+
+                if hasattr(self, "tree") and self.tree.winfo_exists() and self.tree.exists(str(idx)):
+                    tag = nuevo_estado
+                    if "SI" in str(tiene_emb).upper() or "EMBARGO" in str(det_lim).upper() or "HURTO" in str(det_lim).upper():
+                        tag = "EMBARGO"
+                    emb_display = det_lim if det_lim and det_lim != "NINGUNO" else tiene_emb
+                    self.tree.item(
+                        str(idx),
+                        values=(
+                            v["placa"],
+                            v["tipo_doc_runt"],
+                            v["nro_doc"],
+                            v["propietario"],
+                            nuevo_estado,
+                            emb_display,
+                            f"{num_imgs} img"
+                        ),
+                        tags=(tag,)
+                    )
+
+        self.root.after(0, _update_ui_fast)
 
     def _load_patios(self):
         if not self._ensure_authenticated():
@@ -636,24 +893,34 @@ class AutomatizadorRuntGUI:
         anio = self.cmb_anio.get()
         if not patio or not anio:
             return
-        self.log_message(f"Escaneando {patio} -> {anio}...")
-        res = scanner_patios.scan_patio_anio(patio, anio)
-        self.vehicles = res["vehicles"]
-        self.stats = res["stats"]
+        self.log_message(f"⏳ Escaneando {patio} -> {anio}...")
 
-        self.kpi_vars["total"].set(str(self.stats.get("total", 0)))
-        self.kpi_vars["pendientes"].set(str(self.stats.get("pendientes_con_propietario", 0)))
-        self.kpi_vars["completados"].set(str(self.stats.get("completados_ciudadano", 0)))
-        self.kpi_vars["embargos"].set(str(self.stats.get("con_embargo_alerta", 0)))
-        self.kpi_vars["inconsistencias"].set(str(self.stats.get("inconsistencias", 0)))
-        self.kpi_vars["sin_prop"].set(str(self.stats.get("sin_propietario_constancia", 0)))
+        def _bg_scan():
+            res = scanner_patios.scan_patio_anio(patio, anio)
 
-        self._populate_tree()
-        self.log_message(
-            f"Escaneo listo: {self.stats.get('pendientes_con_propietario', 0)} pendientes con propietario | "
-            f"{self.stats.get('completados_ciudadano', 0)} completados | "
-            f"{self.stats.get('sin_propietario_constancia', 0)} cerrados sin propietario."
-        )
+            def _on_scan_done():
+                if not hasattr(self, "tree") or not self.tree.winfo_exists():
+                    return
+                self.vehicles = res["vehicles"]
+                self.stats = res["stats"]
+
+                self.kpi_vars["total"].set(str(self.stats.get("total", 0)))
+                self.kpi_vars["pendientes"].set(str(self.stats.get("pendientes_con_propietario", 0)))
+                self.kpi_vars["completados"].set(str(self.stats.get("completados_ciudadano", 0)))
+                self.kpi_vars["embargos"].set(str(self.stats.get("con_embargo_alerta", 0)))
+                self.kpi_vars["inconsistencias"].set(str(self.stats.get("inconsistencias", 0)))
+                self.kpi_vars["sin_prop"].set(str(self.stats.get("sin_propietario_constancia", 0)))
+
+                self._populate_tree()
+                self.log_message(
+                    f"Escaneo listo: {self.stats.get('pendientes_con_propietario', 0)} pendientes | "
+                    f"{self.stats.get('completados_ciudadano', 0)} completados | "
+                    f"{self.stats.get('sin_propietario_constancia', 0)} sin propietario."
+                )
+
+            self.root.after(0, _on_scan_done)
+
+        threading.Thread(target=_bg_scan, daemon=True).start()
 
     def _populate_tree(self):
         if not hasattr(self, "tree") or not self.tree.winfo_exists():
@@ -697,12 +964,7 @@ class AutomatizadorRuntGUI:
         sel = self.tree.selection()
         if not sel:
             return
-        idx = int(sel[0])
-        self.current_index = idx
-        v = self.vehicles[idx]
-        self.lbl_active_veh.configure(
-            text=f"Seleccionado: {v['placa']} | {v['tipo_doc_runt']} {v['nro_doc']}\n{v['propietario']}"
-        )
+        self.current_index = int(sel[0])
 
     def _open_selected_expediente(self):
         if not self._ensure_authenticated():
@@ -716,14 +978,186 @@ class AutomatizadorRuntGUI:
         os.makedirs(exp_dir, exist_ok=True)
         subprocess.Popen(["explorer", exp_dir])
 
-    def _send_captcha_from_entry(self):
+    def _open_report_generator_dialog(self):
         if not self._ensure_authenticated():
             return
-        txt = self.ent_captcha.get().strip()
-        if not txt:
-            return
-        self.cmd_queue.put(("SUBMIT_CAPTCHA", txt))
 
+        patio_actual = self.cmb_patio.get() if hasattr(self, "cmb_patio") else ""
+        anio_actual = self.cmb_anio.get() if hasattr(self, "cmb_anio") else ""
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Generar Reporte Consolidado desde Base de Datos SQLite")
+        dlg.geometry("540x430")
+        dlg.configure(bg="#1e293b")
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        frame = tk.Frame(dlg, bg="#1e293b", padx=24, pady=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(
+            frame,
+            text="📊 GENERADOR DE REPORTES DESDE SQLITE",
+            bg="#1e293b", fg="#38bdf8",
+            font=("Segoe UI", 13, "bold")
+        ).pack(anchor="w", pady=(0, 6))
+
+        tk.Label(
+            frame,
+            text="Sincroniza los expedientes y extrae toda la información de la base de datos\n(progreso_consultas.db) en un libro Excel con 4 hojas detalladas:",
+            bg="#1e293b", fg="#cbd5e1",
+            font=("Segoe UI", 9), justify="left"
+        ).pack(anchor="w", pady=(0, 12))
+
+        bullets = (
+            "1. RESUMEN EJECUTIVO BD (Totales y % de avance por Patio y Año)\n"
+            "2. BASE DE DATOS VEHÍCULOS (Todas las placas, propietarios, estados y capturas)\n"
+            "3. ALERTAS Y EMBARGOS (Solo vehículos con Embargo, Fiscalía, Prenda o Inconsistencia)\n"
+            "4. AUDITORÍA SESIONES SQLITE (Historial de accesos y tokens de 60 minutos)"
+        )
+        lbl_info = tk.Label(
+            frame, text=bullets,
+            bg="#0f172a", fg="#e2e8f0",
+            font=("Consolas", 8), justify="left", padx=12, pady=10
+        )
+        lbl_info.pack(fill=tk.X, pady=(0, 14))
+
+        tk.Label(
+            frame, text="Selecciona el alcance del reporte a consultar en SQLite:",
+            bg="#1e293b", fg="#f8fafc", font=("Segoe UI", 10, "bold")
+        ).pack(anchor="w", pady=(0, 6))
+
+        scope_var = tk.StringVar(value="PATIO")
+
+        opts = [
+            (f"Todos los Años del Patio Actual ({patio_actual})", "PATIO"),
+            (f"Solo el Año Seleccionado ({patio_actual} - {anio_actual})", "ANIO"),
+            ("Toda la Base de Datos Completa (Todos los Patios y Años)", "TODOS")
+        ]
+        for txt, val in opts:
+            tk.Radiobutton(
+                frame, text=txt, variable=scope_var, value=val,
+                bg="#1e293b", fg="#f8fafc", selectcolor="#0f172a",
+                activebackground="#1e293b", activeforeground="#38bdf8",
+                font=("Segoe UI", 9)
+            ).pack(anchor="w", pady=2)
+
+        lbl_status = tk.Label(
+            frame, text="Listo para exportar desde SQLite.",
+            bg="#1e293b", fg="#4ade80", font=("Segoe UI", 9, "bold")
+        )
+        lbl_status.pack(anchor="w", pady=(10, 8))
+
+        btn_row = tk.Frame(frame, bg="#1e293b")
+        btn_row.pack(fill=tk.X, pady=(4, 0))
+
+        def _run_export(choose_custom_path=False):
+            if not self._ensure_authenticated():
+                dlg.destroy()
+                return
+
+            sc = scope_var.get()
+            custom_out = None
+            if choose_custom_path:
+                custom_out = filedialog.asksaveasfilename(
+                    parent=dlg,
+                    title="Guardar Reporte Excel de Base de Datos SQLite",
+                    defaultextension=".xlsx",
+                    filetypes=[("Libro de Excel (*.xlsx)", "*.xlsx")],
+                    initialfile=f"REPORTE_RUNT_SQLITE_{sc}.xlsx"
+                )
+                if not custom_out:
+                    return
+
+            lbl_status.configure(text="⏳ Sincronizando y consultando tablas SQLite, por favor espera...", fg="#facc15")
+            dlg.update_idletasks()
+
+            def _bg_task():
+                try:
+                    out_file, summary = scanner_patios.generate_sqlite_excel_report(
+                        output_path=custom_out,
+                        scope=sc,
+                        patio=patio_actual,
+                        anio=anio_actual,
+                        log_cb=self.log_message
+                    )
+                    if self.session:
+                        auth_manager.registrar_evento(
+                            self.session.get("username", "usuario"),
+                            "REPORTE_GENERADO",
+                            f"Alcance: {sc} | Total BD: {summary['total_vehiculos']} | Archivo: {os.path.basename(out_file)}"
+                        )
+
+                    def _on_done():
+                        self.log_message(f"📊 Reporte BD generado exitosamente: {out_file}")
+                        if dlg.winfo_exists():
+                            lbl_status.configure(
+                                text=f"✅ ¡Reporte creado! ({summary['total_vehiculos']} vehículos en BD)",
+                                fg="#4ade80"
+                            )
+                        msg_res = (
+                            f"El reporte consolidado fue generado directamente desde la Base de Datos SQLite:\n\n"
+                            f"• Archivo: {out_file}\n\n"
+                            f"RESUMEN EN BASE DE DATOS:\n"
+                            f"• Total vehículos: {summary['total_vehiculos']}\n"
+                            f"• Completados RUNT Ciudadano: {summary['completados']}\n"
+                            f"• Con Embargo / Limitación: {summary['embargos']}\n"
+                            f"• Inconsistencia Propietario: {summary['inconsistencias']}\n"
+                            f"• Sin Propietario (Ley 1730): {summary['sin_propietario']}\n"
+                            f"• Pendientes por consultar: {summary['pendientes']}\n"
+                            f"• Capturas registradas: {summary['total_capturas']}\n\n"
+                            f"¿Deseas abrir el archivo Excel ahora mismo?"
+                        )
+                        parent_win = dlg if dlg.winfo_exists() else self.root
+                        if messagebox.askyesno("Reporte SQLite Generado", msg_res, parent=parent_win):
+                            try:
+                                os.startfile(out_file)
+                            except Exception:
+                                subprocess.Popen(["explorer", os.path.dirname(out_file)])
+                        if dlg.winfo_exists():
+                            dlg.destroy()
+
+                    self.root.after(0, _on_done)
+                except Exception as ex:
+                    def _on_err():
+                        if dlg.winfo_exists():
+                            lbl_status.configure(text=f"❌ Error: {ex}", fg="#f87171")
+                        messagebox.showerror("Error al Generar Reporte", str(ex), parent=dlg if dlg.winfo_exists() else self.root)
+                    self.root.after(0, _on_err)
+
+            threading.Thread(target=_bg_task, daemon=True).start()
+
+        btn_gen_auto = tk.Button(
+            btn_row, text="📥 Generar y Abrir Excel Ahora",
+            bg="#16a34a", fg="#ffffff", font=("Segoe UI", 10, "bold"),
+            relief=tk.FLAT, padx=14, pady=8, cursor="hand2",
+            command=lambda: _run_export(choose_custom_path=False)
+        )
+        btn_gen_auto.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+
+        btn_gen_saveas = tk.Button(
+            btn_row, text="💾 Guardar Como...",
+            bg="#0284c7", fg="#ffffff", font=("Segoe UI", 10, "bold"),
+            relief=tk.FLAT, padx=12, pady=8, cursor="hand2",
+            command=lambda: _run_export(choose_custom_path=True)
+        )
+        btn_gen_saveas.pack(side=tk.LEFT, padx=(0, 6))
+
+        def _open_reports_folder():
+            os.makedirs(scanner_patios.REPORTS_DIR, exist_ok=True)
+            subprocess.Popen(["explorer", scanner_patios.REPORTS_DIR])
+
+        btn_open_rep_dir = tk.Button(
+            btn_row, text="📂 Carpeta Reportes",
+            bg="#475569", fg="#ffffff", font=("Segoe UI", 9, "bold"),
+            relief=tk.FLAT, padx=10, pady=8, cursor="hand2",
+            command=_open_reports_folder
+        )
+        btn_open_rep_dir.pack(side=tk.RIGHT)
+
+    # =========================================================================
+    # 5. CONTROLES DE EJECUCIÓN EN MODO RÁFAGA PARALELO E INDIVIDUAL
+    # =========================================================================
     def _retry_with_doc_type(self, new_doc_type):
         if not self._ensure_authenticated():
             return
@@ -745,183 +1179,99 @@ class AutomatizadorRuntGUI:
             return
         idx = int(sel[0])
         self.is_paused = False
+        if self.cluster:
+            self.cluster.is_paused = False
         self.cmd_queue.put(("SINGLE", idx))
 
     def _start_batch_process(self):
         if not self._ensure_authenticated():
             return
-        if self.is_running_batch:
-            self.is_paused = False
-            self.log_message("Reanudando lote automático...")
-            return
+        num_ch = self._get_selected_num_channels()
+        sel = self.tree.selection()
+        start_idx = int(sel[0]) if sel else 0
+
         self.is_running_batch = True
         self.is_paused = False
-        self.cmd_queue.put(("START_BATCH", None))
+        if self.cluster:
+            self.cluster.is_paused = False
+        self.btn_pause.configure(text="⏸ Pausar Ráfaga", bg="#d97706")
+        self.cmd_queue.put(("START_PARALLEL_BATCH", (start_idx, num_ch)))
 
     def _toggle_pause(self):
         if not self._ensure_authenticated():
             return
         self.is_paused = not self.is_paused
+        if self.cluster:
+            self.cluster.is_paused = self.is_paused
         if self.is_paused:
-            self.log_message("⏸ Lote en pausa. Terminará el vehículo actual y se detendrá.")
-            self.btn_pause.configure(text="▶ Continuar Lote", bg="#16a34a")
+            self.log_message("⏸ Ráfaga en pausa. Deteniendo canales activos...")
+            self.btn_pause.configure(text="▶ Reanudar Ráfaga", bg="#16a34a")
+            for sid in range(self.MAX_CHANNELS):
+                if self.cluster:
+                    self.cluster.route_captcha_to_slot(sid, "__CANCEL__")
         else:
-            self.log_message("▶ Continuando lote automático...")
-            self.btn_pause.configure(text="⏸ Pausar Lote", bg="#d97706")
-            self.cmd_queue.put(("START_BATCH", None))
+            self.log_message("▶ Reanudando Modo Ráfaga Multi-Pestaña...")
+            self.btn_pause.configure(text="⏸ Pausar Ráfaga", bg="#d97706")
+            num_ch = self._get_selected_num_channels()
+            self.cmd_queue.put(("START_PARALLEL_BATCH", (0, num_ch)))
 
-    def _playwright_worker_loop(self):
-        bot = RuntCiudadanoBot(log_callback=self.log_message)
+    def _async_worker_thread_entry(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(self._async_worker_loop())
+
+    async def _async_worker_loop(self):
+        self.cluster = RuntParallelCluster(
+            log_cb=self.log_message,
+            ui_slot_cb=self._on_slot_state_update,
+            on_vehicle_done_cb=self._on_vehicle_completed_from_cluster,
+            check_auth_fn=self._ensure_authenticated
+        )
+
         while True:
             try:
-                cmd, payload = self.cmd_queue.get()
+                cmd, payload = await asyncio.get_event_loop().run_in_executor(None, self.cmd_queue.get)
                 if cmd == "CLOSE_BROWSER":
-                    bot.stop_browser()
+                    await self.cluster.stop_cluster()
                     break
                 if not self._ensure_authenticated():
                     continue
 
-                if cmd == "SUBMIT_CAPTCHA":
-                    bot.submit_captcha_from_gui(payload)
-                elif cmd == "SINGLE":
-                    self._process_one_vehicle(bot, payload)
-                elif cmd == "START_BATCH":
-                    for idx, v in enumerate(self.vehicles):
-                        if self.is_paused or not self._ensure_authenticated():
-                            break
-                        if v["estado"] == "PENDIENTE":
-                            self._process_one_vehicle(bot, idx)
+                if cmd == "SINGLE":
+                    idx = payload
+                    if 0 <= idx < len(self.vehicles):
+                        await self.cluster.start_cluster(1)
+                        await self.cluster.process_vehicle_on_slot(self.cluster.slots[0], idx, self.vehicles[idx])
+
+                elif cmd == "START_PARALLEL_BATCH":
+                    start_idx, num_ch = payload
+                    # Tomar primero desde el vehículo seleccionado hacia adelante, y luego los pendientes anteriores si quedaron
+                    pending_list = [
+                        (i, v) for i, v in enumerate(self.vehicles)
+                        if i >= start_idx and v["estado"] == "PENDIENTE"
+                    ]
+                    if not pending_list:
+                        pending_list = [
+                            (i, v) for i, v in enumerate(self.vehicles)
+                            if v["estado"] == "PENDIENTE"
+                        ]
+                    if not pending_list:
+                        self.log_message("ℹ No hay vehículos pendientes por consultar en este año.")
+                        continue
+
+                    await self.cluster.run_batch_parallel(pending_list, num_channels=num_ch)
                     self.is_running_batch = False
-                    if not self.is_paused and self.session:
-                        self.log_message("✅ Lote de vehículos pendientes finalizado.")
+
             except Exception as e:
-                self.log_message(f"Error en trabajador Playwright: {e}")
+                self.log_message(f"Error en orquestador paralelo: {e}")
                 self.is_running_batch = False
 
-    def _process_one_vehicle(self, bot, idx):
-        if not self._ensure_authenticated():
-            return
-
-        v = self.vehicles[idx]
-        placa = v["placa"]
-        tipo_doc = v["tipo_doc_runt"]
-        nro_doc = v["nro_doc"]
-        exp_dir = v["exp_dir"]
-
-        def _highlight_row():
-            if hasattr(self, "tree") and self.tree.winfo_exists() and self.tree.exists(str(idx)):
-                self.tree.selection_set(str(idx))
-                self.tree.see(str(idx))
-            if hasattr(self, "lbl_active_veh") and self.lbl_active_veh.winfo_exists():
-                self.lbl_active_veh.configure(
-                    text=f"Consultando ahora: {placa} | {tipo_doc}: {nro_doc}\n{v['propietario']}"
-                )
-        self.root.after(0, _highlight_row)
-
-        bot.start_browser()
-
-        while True:
-            if not self._ensure_authenticated():
-                return
-            cap_bytes = bot.fill_vehicle_form(placa, tipo_doc, nro_doc)
-            self._update_captcha_preview(cap_bytes)
-
-            outcome, detail = self._wait_with_gui_captcha_support(bot)
-            if outcome == "CAPTCHA_ERROR":
-                self.log_message(f"Reintentando Captcha para {placa}...")
-                continue
-            break
-
-        if outcome == "SUCCESS":
-            num_imgs, analysis = bot.capture_full_vehicle_expediente(exp_dir, placa)
-            tiene_emb = analysis.get("tiene_embargo", "NO")
-            det_lim = analysis.get("detalle_limitacion", "NINGUNO")
-            soat_est = analysis.get("soat_estado", "-")
-            rtm_est = analysis.get("rtm_estado", "-")
-
-            scanner_patios.save_consulta_result(
-                v["patio"], v["anio"], placa, v["propietario"],
-                tipo_doc, nro_doc, "COMPLETADO_CIUDADANO",
-                tiene_emb, det_lim, soat_est, rtm_est, num_imgs, exp_dir
-            )
-            if tiene_emb != "NO":
-                self.log_message(f"🚨 ALERTA {placa}: {det_lim}")
-            else:
-                self.log_message(f"✅ {placa} completado sin limitaciones (5 capturas archivadas).")
-
-        elif outcome == "INCONSISTENCIA":
-            num_imgs = bot.capture_inconsistencia(exp_dir, placa)
-            scanner_patios.save_consulta_result(
-                v["patio"], v["anio"], placa, v["propietario"],
-                tipo_doc, nro_doc, "INCONSISTENCIA_PROPIETARIO",
-                "NO", "No corresponde con propietarios activos", "-", "-", num_imgs, exp_dir
-            )
-            self.log_message(f"⚠ {placa}: Inconsistencia de propietario activo guardada.")
-
-        self.root.after(0, self._scan_current_selection)
-
-    def _wait_with_gui_captcha_support(self, bot, timeout_sec=240):
-        import time
-        start = time.time()
-        page = bot.page
-        while time.time() - start < timeout_sec:
-            if not self._ensure_authenticated():
-                return "SESSION_EXPIRED", "Sesión expirada"
-
-            try:
-                cmd, payload = self.cmd_queue.get_nowait()
-                if cmd == "SUBMIT_CAPTCHA":
-                    bot.submit_captcha_from_gui(payload)
-            except queue.Empty:
-                pass
-
-            if not page or page.is_closed():
-                return "CLOSED", ""
-
-            try:
-                btn_otra = page.locator("button:has-text('Realizar otra consulta')")
-                if btn_otra.count() > 0 and btn_otra.first.is_visible():
-                    page.wait_for_timeout(900)
-                    return "SUCCESS", "OK"
-            except Exception:
-                pass
-
-            try:
-                modal_txt = page.evaluate("""() => {
-                    const btns = Array.from(document.querySelectorAll('button'));
-                    const aceptar = btns.find(b => b.innerText.trim() === 'Aceptar' && b.offsetParent !== null);
-                    if (aceptar) {
-                        const container = aceptar.closest('mat-dialog-container, .swal2-popup, .modal-content') || aceptar.parentElement.parentElement;
-                        return (container?.innerText || '').trim();
-                    }
-                    return null;
-                }""")
-                if modal_txt:
-                    up = modal_txt.upper()
-                    if "NO CORRESPONDEN CON LOS PROPIETARIOS ACTIVOS" in up:
-                        return "INCONSISTENCIA", modal_txt
-                    elif "CAPTCHA" in up or "CARACTERES" in up or "IMAGEN" in up or "CODIGO" in up or "CÓDIGO" in up:
-                        btn_ac = page.locator("button:has-text('Aceptar')")
-                        if btn_ac.count() > 0:
-                            btn_ac.first.click()
-                        page.wait_for_timeout(600)
-                        return "CAPTCHA_ERROR", modal_txt
-                    else:
-                        return "INCONSISTENCIA", modal_txt
-            except Exception:
-                pass
-
-            page.wait_for_timeout(350)
-
-        return "TIMEOUT", "Timeout"
-
     def _on_close_window(self):
-        """
-        Al cerrar la ventana, revoca inmediatamente el token en SQLite para que
-        la próxima vez que se abra el programa obligatoriamente pida iniciar sesión.
-        """
         self.is_paused = True
         self.is_running_batch = False
+        if self.cluster:
+            self.cluster.is_paused = True
+            self.cluster.stop_requested = True
         if self.session and self.session.get("token"):
             auth_manager.logout_session(self.session["token"], "CIERRE_VENTANA_APLICACION")
         auth_manager.invalidate_all_active_sessions("CIERRE_TOTAL_APLICACION")
